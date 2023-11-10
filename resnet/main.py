@@ -73,8 +73,6 @@ def train(net, trainloader, valloader, device, optimizer, num_epochs, scheduler,
 
 
 def main():
-    writer = SummaryWriter()
-
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_name', required=True)
     parser.add_argument('--dataset', required=True)
@@ -84,11 +82,14 @@ def main():
     parser.add_argument('--batch_size', default=256, type=int)
     parser.add_argument('--num_epochs', default=100, type=int)
     args = parser.parse_args()
+
     if not os.path.exists(f'./{args.model_name}'):
         os.mkdir(f'./{args.model_name}')
     use_amp = True
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    writer = SummaryWriter(log_dir=args.dataset)
 
     if args.dataset.lower() == 'cifar10':
         net = model.ResNet(3, 32, 10)
