@@ -1,50 +1,50 @@
-# Import statements
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-# Function definitions
-class VAE(nn.Module):
-    def __init__(self, input_size, hidden_size, latent_size):
-        super().__init__()
-        self.enc = Encoder(input_size, hidden_size, latent_size)
-        self.dec = Decoder(input_size, hidden_size, latent_size)
-
-    def forward(self, x, znoise):
-        zmean, zstd = self.enc(x)
-        z = zmean + zstd * znoise
-        y = self.dec(z)
-        return y, zmean, zstd
-
-    def sample(self, znoise):
-        return self.dec(znoise)
 
 class Encoder(nn.Module):
-    def __init__(self, input_size, hidden_size, latent_size):
+    def __init__(self, input_channels, hidden_size, latent_dim):
         super().__init__()
-        self.fc = nn.Linear(input_size, hidden_size)
-        self.mean_layer = nn.Linear(hidden_size, latent_size)
-        self.logvar_layer = nn.Linear(hidden_size, latent_size)
-        self.latent_size = latent_size
+        self.conv = nn.Sequential(
+            nn.Conv2d(input_channels, hidden_size, kernel_size=3, padding=1, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(hidden_size, hidden_size, kernel_size=3, padding=1, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(hidden_size, 2 * hidden_size, kernel_size=3, padding=1, stride=2),
+            nn.ReLU(),
+            nn.Flatten(),  # Image grid to single feature vector
+        )
+        self.mean_layer = nn.Linear(2 * hidden_size * 4 * 4, latent_dim)
+        self.log_std_layer = nn.Linear(2 * hidden_size * 4 * 4, latent_dim)
 
     def forward(self, x):
-        x = F.relu(self.fc(x))
+        x = self.conv(x)
         zmean = self.mean_layer(x)
-        zstd = torch.sqrt(torch.exp(self.logvar_layer(x)))
+        zstd = torch.exp(self.log_std_layer(x))
         return zmean, zstd
 
+
 class Decoder(nn.Module):
-    def __init__(self, input_size, hidden_size, latent_size):
+    def __init__(self, input_channels, hidden_size, latent_dim):
         super().__init__()
-        self.fc1 = nn.Linear(latent_size, hidden_size)
-        self.out = nn.Linear(hidden_size, input_size)
+        self.linear = nn.Sequential(
+            nn.Linear(latent_dim, 2 * 16 * hidden_size),
+            nn.ReLU(),
+        )
+        self.net = nn.Sequential(
+            nn.ConvTranspose2d(2 * hidden_size, hidden_size, kernel_size=3, padding=1, stride=2, output_padding=0),
+            nn.ReLU(),
+            nn.ConvTranspose2d(hidden_size, hidden_size, kernel_size=3, padding=1, stride=2, output_padding=1),
+            nn.ReLU(),
+            nn.ConvTranspose2d(hidden_size, input_channels, kernel_size=3, padding=1, stride=2, output_padding=1),
+        )
 
     def forward(self, z):
-        z = F.relu(self.fc1(z))
-
-        # We use a sigmoid activation as our pixels are values between 0 and 1.
-        y = F.sigmoid(self.out(z))
+        y = self.linear(z)
+        y = y.reshape(y.shape[0], -1, 4, 4)
+        y = self.net(y)
         return y
+
 
 if __name__ == "__main__":
     pass

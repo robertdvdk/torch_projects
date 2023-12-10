@@ -2,77 +2,136 @@
 import torch
 import torchvision
 import torch.nn.functional as F
-from torch.distributions.multivariate_normal import MultivariateNormal
-import torch.utils.data
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
+from dataset import mnist
+
+from model import Encoder, Decoder
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint
 import os
 import argparse
-import json
-from model import VAE
-import torch.profiler
-import time
 
-# Function definitions
-def train(vae, loader, opt, sched, savedir, device, epochs, latent_size):
-    zdist = MultivariateNormal(torch.zeros(latent_size), torch.eye(latent_size))
-    for epoch in range(epochs):
-        start = time.time()
-        for step, (x, _) in enumerate(loader):
-            x = x.to(device)
-            znoise = zdist.sample_n(x.shape[0]).to(device)
-            x = x.view(x.shape[0], -1)
-            y, zmean, zstd = vae(x, znoise)
-            L1 = -0.5 * torch.sum(1 + torch.log(torch.square(zstd)) - torch.square(zmean) - torch.square(zstd))
-            L2 = F.mse_loss(y, x, reduction='sum')
-            L = (L1 + L2)
-            L.backward()
-            opt.step()
-            opt.zero_grad()
-        print(f'L1: {round(L1.item(), 2)}\tL2: {round(L2.item(), 2)}')
-        end = time.time()
-        print(end - start)
-        sched.step()
-        plt.imshow(x[1].cpu().view(28, 28))
-        plt.savefig(f'./{savedir}/groundtruth_{epoch}.png')
-        plt.imshow(y[1].detach().cpu().view(28, 28))
-        plt.savefig(f'./{savedir}/reconstructed_{epoch}.png')
 
-        # To generate a random sample, we sample z ~ N(0, I), and pass it through the decoder.
-        znoise = zdist.sample_n(1).to(device)
-        y = vae.sample(znoise)
-        plt.imshow(y.detach().cpu().view(28, 28))
-        plt.savefig(f'./{savedir}/generated_{epoch}.png')
+class VAE(pl.LightningModule):
+    def __init__(self, input_channels, hidden_size, latent_dim, lr):
+        super().__init__()
+        self.save_hyperparameters()
 
-        with open(f'./{savedir}/log.txt', 'a') as fopen:
-            fopen.write(f'Epoch: {epoch}\nLR: {sched.get_last_lr()}\nL1: {-L1}\nL2: {-L2}\n')
-    torch.save(vae.state_dict(), f'./{savedir}/vae.pt')
+        self.enc = Encoder(input_channels, hidden_size, latent_dim)
+        self.dec = Decoder(input_channels, hidden_size, latent_dim)
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--save_dir', default='results', type=str, help='Path to the save directory')
-    parser.add_argument('--hidden_size', default=500, type=int, help='Number of hidden neurons')
-    parser.add_argument('--latent_size', default=10, type=int, help='Dimensionality of the latent space')
-    parser.add_argument('--batch_size', default=256, type=int, help='Batch size')
-    parser.add_argument('--lr', default=0.001, type=float, help='Learning rate')
-    parser.add_argument('--epochs', default=100, type=int, help='Number of epochs')
-    args = parser.parse_args()
-    if not os.path.exists(f'./{args.save_dir}/'):
-        os.mkdir(f'./{args.save_dir}/')
-    with open(f'./{args.save_dir}/args.txt', 'a') as fopen:
-        json.dump(args.__dict__, fopen, indent=2)
+    def forward(self, x):
+        zmean, zstd = self.enc(x)
+        z = zmean + zstd * torch.randn(zmean.shape, device=zmean.device)
+        y = self.dec(z)
+        L_reconstruction = F.mse_loss(y, x, reduction='sum')
+        L_regularization = -0.5 * torch.sum(1 + torch.log(torch.square(zstd)) - torch.square(zmean) - torch.square(zstd))
+        return L_reconstruction, L_regularization
 
-    trainset = torchvision.datasets.MNIST(root='./data/', download=True, train=True, transform=torchvision.transforms.ToTensor())
-    trainloader = torch.utils.data.DataLoader(trainset, batch_size=args.batch_size, drop_last=True, shuffle=True, num_workers=4)
+    @torch.no_grad()
+    def sample(self, batch_size):
+        y = self.dec(torch.randn(batch_size, self.hparams.latent_dim, device=self.device))
+        return y
 
-    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
-    vae = VAE(784, args.hidden_size, args.latent_size).to(device)
-    print(f'Training on {device}')
-    optimizer = torch.optim.AdamW(vae.parameters(), lr=args.lr)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 5, 0.9)
+    def training_step(self, batch, batch_idx):
+        x, _ = batch
+        L_reconstruction, L_regularization = self.forward(x)
+        ELBO = L_reconstruction + L_regularization
+        self.log("train_L_reconstruction", L_reconstruction, on_step=False, on_epoch=True)
+        self.log("train_L_regularization", L_regularization, on_step=False, on_epoch=True)
+        self.log("train_ELBO", ELBO, on_step=False, on_epoch=True)
+        return ELBO
 
-    train(vae, trainloader, optimizer, scheduler, args.save_dir, device, args.epochs, args.latent_size)
+    def validation_step(self, batch, batch_idx):
+        x, _ = batch
+        L_reconstruction, L_regularization = self.forward(x)
+        ELBO = L_reconstruction + L_regularization
+        self.log("val_L_reconstruction", L_reconstruction, on_step=False, on_epoch=True)
+        self.log("val_L_regularization", L_regularization, on_step=False, on_epoch=True)
+        self.log("val_ELBO", ELBO, on_step=False, on_epoch=True)
+
+    def test_step(self, batch, batch_idx):
+        x, _ = batch
+        L_reconstruction, L_regularization = self.forward(x)
+        ELBO = L_reconstruction + L_regularization
+        self.log("test_ELBO", ELBO, on_step=False, on_epoch=True)
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
+        return optimizer
+
+
+class GenerateCallback(pl.Callback):
+    def __init__(self, batch_size, every_n_epochs, save_to_disk):
+        super().__init__()
+        self.batch_size = batch_size
+        self.every_n_epochs = every_n_epochs
+        self.save_to_disk = save_to_disk
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        if (trainer.current_epoch+1) % self.every_n_epochs == 0:
+            self.sample_and_save(trainer, pl_module, trainer.current_epoch+1)
+
+    def sample_and_save(self, trainer, pl_module, epoch):
+        samples = pl_module.sample(self.batch_size)
+        grid = torchvision.utils.make_grid(samples, nrow=8, normalize=True, value_range=(0, 1), pad_value=0.5)
+        grid = grid.detach().cpu()
+        trainer.logger.experiment.add_image("Samples", grid, global_step=epoch)
+        if self.save_to_disk:
+            torchvision.utils.save_image(grid,
+                        os.path.join(trainer.logger.log_dir, f"epoch_{epoch}_samples.png"))
+
+
+def train(args):
+    os.makedirs(args.log_dir, exist_ok=True)
+    trainloader, valloader, testloader = mnist(args.batch_size)
+
+    save = ModelCheckpoint(save_weights_only=True, monitor="val_ELBO")
+    generate = GenerateCallback(batch_size=64, every_n_epochs=5, save_to_disk=True)
+    trainer = pl.Trainer(default_root_dir=args.log_dir, accelerator="auto",
+                         max_epochs=args.epochs, callbacks=[save, generate])
+
+    pl.seed_everything(args.seed)
+    model = VAE(input_channels=1, hidden_size=args.hidden_size, latent_dim = args.latent_dim, lr=args.lr)
+
+    # Train model
+    trainer.fit(model, trainloader, valloader)
+
+    # Test model
+    model = VAE.load_from_checkpoint(trainer.checkpoint_callback.best_model_path)
+    test_result = trainer.test(model, testloader)
+
+    return test_result
+
 
 if __name__ == "__main__":
-    main()
+    # Feel free to add more argument parameters
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+
+    # Model hyperparameters
+    parser.add_argument('--latent_dim', default=20, type=int,
+                        help='Dimensionality of latent space')
+    parser.add_argument('--hidden_size', default=32, type=int,
+                        help='Number of filters to use in the CNN encoder/decoder.')
+
+    # Optimizer hyperparameters
+    parser.add_argument('--lr', default=1e-3, type=float,
+                        help='Learning rate to use')
+    parser.add_argument('--batch_size', default=128, type=int,
+                        help='Minibatch size')
+
+    # Other hyperparameters
+    parser.add_argument('--data_dir', default='../data/', type=str,
+                        help='Directory where to look for the data.')
+    parser.add_argument('--epochs', default=80, type=int,
+                        help='Max number of epochs')
+    parser.add_argument('--seed', default=42, type=int,
+                        help='Seed to use for reproducing results')
+    parser.add_argument('--num_workers', default=4, type=int,
+                        help='Number of workers to use in the data loaders.')
+    parser.add_argument('--log_dir', default='VAE_logs', type=str,
+                        help='Directory where the PyTorch Lightning logs should be created.')
+
+    args = parser.parse_args()
+
+    train(args)
