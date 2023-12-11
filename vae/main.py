@@ -177,7 +177,7 @@ def train(args: argparse.Namespace) -> [dict]:
 
     """
     os.makedirs(args.log_dir, exist_ok=True)
-    trainloader, valloader, testloader = mnist(args.batch_size)
+    trainloader, valloader, testloader = mnist(args.batch_size, args.data_dir)
 
     save = ModelCheckpoint(save_weights_only=True, monitor="val_ELBO")
     generate = GenerateCallback(batch_size=64, every_n_epochs=5, save_to_disk=True)
@@ -214,7 +214,7 @@ if __name__ == "__main__":
                         help='Minibatch size')
 
     # Other hyperparameters
-    parser.add_argument('--data_dir', default='../data/', type=str,
+    parser.add_argument('--data_dir', default='../../data/', type=str,
                         help='Directory where to look for the data.')
     parser.add_argument('--epochs', default=80, type=int,
                         help='Max number of epochs')
